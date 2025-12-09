@@ -1,0 +1,967 @@
+---
+title: "PREVIC Item selection"
+output: html_document
+date: "2023-07-20"
+---
+
+# Packages
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(ggthemes)
+library(tidybayes)
+library(brms)
+library(rstan)
+library(loo)
+library(coda)
+# library(testing) can't find 
+library(ggridges)
+library(lavaan)
+library(ggbreak)
+library(grid)
+library(cowplot)
+library(TAM)
+
+
+theme_set(bayesplot::theme_default())
+estimate_mode <- function(s) {
+  d <- density(s)
+  return(d$x[which.max(d$y)])
+}
+
+hdi_upper<- function(s){
+  m <- HPDinterval(mcmc(s))
+  return(m["var1","upper"])
+}
+
+hdi_lower<- function(s){
+  m <- HPDinterval(mcmc(s))
+  return(m["var1","lower"])
+}
+
+func <- function(x){
+  abs(1-x)
+}
+
+if (!dir.exists("models")) {
+  dir.create("models")
+}
+
+```
+
+# Data
+
+The original dataset contains response data of 379 items from 1190 participants. It is a quite large dataset. In the original paper, the authors used a set of 'computational expensive' approaches, that can hardly run on a 'personal computer' like mine. But at some point I think there is a certain extent of computation power waste, that one can actually conduct similar task with similar model performance (or even better with alternative reasonings/considerations.)
+
+I'll quicky review the goal of the paper and start my alternative demo.
+
+**goal**: 
+i. I want to have a set of 'good' items, that my ultimate models follows 1PL (Rasch) settings (i.e., have better or equal performance even not estimating discrimination);
+ii. I want my items list can have a good difficulty distribution, that children from all ability ranges can have conduct informative 'perfect' item in the test (in Rasch model, 'perfect' item is the one with the same difficulty score as participants' ability);
+
+```{r}
+data <- read_csv("../data/previc_data.csv")%>%
+  mutate(age_group = factor(substr(age, 1,1)))
+
+irt_dat <- data%>%
+  select(subjID, word, score, sex, aoa_rating_german)
+
+aoa <- data%>%distinct(word, .keep_all = T)%>%select(word, aoa_rating_german)
+
+full <- data%>%
+  group_by(subjID)%>%
+  summarise(mean_full = mean(score))
+
+
+target_words_orig <- read_csv("../data/final_item_list.csv") %>% 
+  pull(word)
+
+prior_2pl <- 
+  prior("normal(0, 2)", class = "b", nlpar = "eta") +
+  prior("normal(0, 1)", class = "b", nlpar = "logalpha") +
+  prior("constant(1)", class = "sd", group = "subjID", nlpar = "eta") + 
+  prior("normal(0, 3)", class = "sd", group = "word", nlpar = "eta") +
+  prior("normal(0, 1)", class = "sd", group = "word", nlpar = "logalpha")
+
+prior_1pl <- 
+  prior("normal(0, 1)", class = "sd", group = "subjID") + 
+  prior("normal(0, 3)", class = "sd", group = "word")
+
+# Note: I mainly adopt the original prior settings, but I'm not sure why the original paper used (0,1) instead of (0,3) by convention for person ability. 
+
+formula_irt1 <- bf(
+    score ~ 1 + (1 | word) + (1 | subjID)
+  ) # 1pl
+
+
+
+formula_irt2 <- bf(
+    score ~ exp(logalpha) * eta,
+    eta ~ 1 + (1 |i| word) + (1 | subjID),
+    logalpha ~ 1 + (1 |i| word),
+    nl = TRUE #2pl
+  )
+```
+# Original solution
+
+Let's quickly review the original solution in the paper. Following a rigor (yet really expensive) workflow, authors get 89 items. The model includes difficulty distributions like this:
+It looks overall good, as it has a good distribution from -5 ~ 4, and all items difficulty posterior seems not too wide. 
+But if someone is picky enough, might spot on that from -5 ~ -2.5, the distribution seems quite sparse. Another critique might be, the simulated annealing algorithm blindly optimizes for equidistant spacing via a stochastic process, fundamentally ignoring whether the resulting difficulty distribution makes practical sense. Consequently, it treats an item with a Rasch difficulty of -5 as a valid selection to fill a gap, even though such an item is likely too easy to provide good enough information.
+
+```{r}
+irt_dat_ori <- irt_dat %>%
+  filter(word %in% target_words_orig)
+
+irt_ori <- brm(
+  formula = formula_irt1,
+  data = irt_dat_ori,
+  family = brmsfamily("bernoulli"), 
+  prior = prior_1pl,
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  chains = 4,
+  iter = 2000,   
+  warmup = 1000,
+  seed = 12345,
+  backend = "cmdstanr",
+  threads = threading(2),
+  file = "../models/irt_ori.rds" 
+)
+
+```
+
+```{r}
+item_ori_1pl <- ranef(irt_ori)$word
+
+
+item_ori_1pl[, , "Intercept"] %>%
+  as_tibble() %>%
+  rownames_to_column() %>%
+  rename(item = "rowname") %>%
+  mutate(item = reorder(item, Estimate)) %>% 
+  ggplot(aes(item, Estimate, ymin = Q2.5, ymax = Q97.5)) +
+    geom_pointrange() +
+    coord_flip() + 
+    labs(x = "Item Number")
+```
+
+
+
+# Step 1: Rough screening
+
+In original paper, authors fit a global BIRT for 379 items, and then calculate in/out fit for each iteration, getting the mode as the proxy of in/out fit of BIRT. Then they go for frequentist screening by applying 0.7/1.3 rule.
+For two reasons I don't like the solution:
+  1. This is the main reason - it's impossible to replicate this in my own computer. I tried to reduce the chain to 4, and iteration to 1000, with random sampling for 500 from 1179, still takes 1 hour to run and the model can't converge. It's too expensive.
+  2. I don't think MCMC/Bayesian approach here add any information for the rough screening. The major advantage for BIRT is that it estimates uncertainty by providing posterior instead of point estimate, while the posterior is completely missing in the paper. If we refer to BIRT tutorial papers (e.g., Bürkner, 2021; Zhang, 2025), people usually use "visual qualitative" solution, by spotting poor items if there is any with really wide posterior or really off estimates. While if the final goal is to use a point estimate to do rough screening, I can use frequentist IRT to do this naturally. I'll put in this way - in/oout fit tells you how bad the model did by giving a point estimate; while in BIRT you can directly tell from the item difficulty posterior, the wider the poorer, if we want to directly use the mode/posterior mean. 
+
+As an affordable alternative, here I use TAM to fit a 1PL, and use 0.7/1.3 benchmark naturally. 
+
+```{r}
+wide_dat <- irt_dat %>%
+  select(subjID, word, score) %>%
+  distinct(subjID, word, .keep_all = TRUE) %>%
+  pivot_wider(names_from = word, values_from = score) %>%
+  column_to_rownames("subjID")
+
+resp <- as.matrix(wide_dat)
+
+cat(sprintf("Matrix ready: %d Persons x %d Items\n", nrow(resp), ncol(resp)))
+```
+
+```{r}
+item_ids <- colnames(resp) 
+
+
+mod_1pl <- tam.mml(resp, irtmodel = "1PL", verbose = FALSE)
+fit_stats <- tam.fit(mod_1pl)
+
+
+res_1pl <- fit_stats$itemfit %>%
+  as_tibble() %>%
+  mutate(item_id = item_ids) %>% 
+  select(item_id, Infit_MSQ = Infit, Outfit_MSQ = Outfit)
+
+good_fit_items <- res_1pl %>%
+  filter(Infit_MSQ > 0.7 & Infit_MSQ < 1.3) %>%
+  filter(Outfit_MSQ > 0.7 & Outfit_MSQ < 1.3)
+
+cat(sprintf("1PL Filter (0.7 < MSQ < 1.3): %d items passed\n", nrow(good_fit_items)))
+```
+We now use less than 10 seconds to fit a rough screening model, and have 211 items passed. The number is very similar to 212 in the original paper (where they use global BIRT + manually in/out fit for every iteration). We can check whether they provide similar information as well - 93% of them are the same. As a demo I won't go through the 7% difference in detail - and engineeringly, I assume these outliers will not be selected in final 90 anyway.
+
+```{r}
+my_list <- good_fit_items$item_id
+
+target_list <- readRDS("../original/fit_selected_items.rds") # 212 item list from original paper
+
+common_items <- intersect(my_list, target_list)
+
+jaccard <- length(common_items) / length(union(my_list, target_list))
+jaccard
+
+```
+
+# Step2: 
+
+```{r}
+my_list <- good_fit_items$item_id
+
+
+irt_dat_selected <- irt_dat %>%
+  filter(word %in% my_list)
+```
+
+Now I follow the original paper's solution, to fit 1pl and 2pl for selected items. For convience, I change the setting for quicker fitting, it results in higher rhat and ess, but since this is a demo I'll ignore it.
+
+
+```{r}
+irt1 <- brm(
+  formula = formula_irt1,
+  data = irt_dat_selected,
+  family = brmsfamily("bernoulli"),
+   prior = prior_1pl,
+   init = 0,
+   control = list(adapt_delta = 0.95, max_treedepth = 15),
+   cores = 4,
+   chains = 4,
+   iter = 2000,
+   warmup = 1000,
+   seed = 1234,
+   backend = "cmdstanr",
+   threads = threading(2),
+   file = "../models/irt1.rds" ) # runs approximately 50 mins
+
+irt1 <- add_criterion(
+  irt1,
+  criterion = c("loo"),
+  cores = 8,
+  pointwise = TRUE,
+  ndraws = 1000
+)
+
+saveRDS(irt1, "/Users/chi/Desktop/previc-optimization-demo/models/irt1.rds")
+```
+
+```{r}
+irt2 <- brm(
+  formula = formula_irt2,
+  data = irt_dat_selected,
+  family = brmsfamily("bernoulli" , link = "logit"),
+   prior = prior_2pl,
+   init = 0,
+   control = list(adapt_delta = 0.95, max_treedepth = 15),
+   cores = 4,
+   chains = 4,
+   iter = 2000,
+   warmup = 1000,
+   seed = 1234,
+   backend = "cmdstanr",
+   threads = threading(2),
+   file = "../models/irt2.rds" ) 
+
+irt2 <- add_criterion(
+  irt2,
+  criterion = c("loo"),
+  cores = 8,
+  pointwise = TRUE,
+  ndraws = 1000
+)
+
+saveRDS(irt1, "/Users/chi/Desktop/previc-optimization-demo/models/rt2.rds")
+```
+
+
+```{r}
+
+item_1pl <- ranef(irt1)$word
+
+
+item_1pl[, , "Intercept"] %>%
+  as_tibble() %>%
+  rownames_to_column() %>%
+  rename(item = "rowname") %>%
+  mutate(item = reorder(item, Estimate)) %>% 
+  ggplot(aes(item, Estimate, ymin = Q2.5, ymax = Q97.5)) +
+    geom_pointrange() +
+    coord_flip() + 
+    labs(x = "Item Number")
+```
+
+
+
+```{r}
+
+item_pars <- coef(irt2)$word
+
+eta_df <- item_pars[, , "eta_Intercept"] %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column(var = "item") %>%
+
+  arrange(Estimate) %>%
+  mutate(item = factor(item, levels = item)) %>%
+  select(item, Estimate, Q2.5, Q97.5)
+
+
+alpha_df <- item_pars[, , "logalpha_Intercept"] %>%
+  exp() %>% 
+  as_tibble(rownames = NA) %>%
+  rownames_to_column(var = "item") %>%
+  arrange(Estimate) %>%
+  mutate(item = factor(item, levels = item)) %>%
+  select(item, Estimate, Q2.5, Q97.5)
+
+p1 <- ggplot(eta_df, aes(x = item, y = Estimate, ymin = Q2.5, ymax = Q97.5)) +
+  geom_pointrange() +
+  coord_flip() +
+  labs(
+    x = "Sorted",
+    y = "Easiness Estimate",
+    title = "Item Easiness Parameter (Eta)"
+  ) 
+  
+
+
+p2 <- ggplot(alpha_df, aes(x = item, y = Estimate, ymin = Q2.5, ymax = Q97.5)) +
+  geom_pointrange() +
+  coord_flip() +
+  labs(
+    x = "Sorted",
+    y = "Discrimination Estimate",
+    title = "Item Discrimination Parameter"
+  ) 
+
+  
+p1|p2
+```
+
+
+
+
+```{r}
+loo(irt1,irt2)
+```
+
+# Step 3: Cost function
+
+In the original paper, authors have a cost function assign to each items as the standard deviation for item difficulties was multiplied by – 1/3, Infit values by – 4, Outfit values by – 2 and modification indices by – 1/100. Basically, it is an aggregation of 3 considerations: i. difficulty (spacing); ii. fit stats (how good is the item?) iii. modification indices (how rasch is the item?).
+
+Again, in this cost function, the uncertainty of items is ignored. Though items with significant uncertainty always being misfit, thus fit stats can reflect this, as we already conduct BIRT, I'll use width of posterior instead (estimating fit stats in BIRT is too expensive for me.) Plus, for MI, I'll use logalpha (discrimination) instead. I'll assign a penalty function to items depends on the distance to 1 (desirable Rasch discrimination).
+
+And most importantly, authors use simulated annealing, as the spacing function is relative, it depends on different item list. This is fancinating, yet expensive and I believe is an overkill. We can easily turn this stochastic process to more linear calculation. For example, we'll expecting an Rasch assessment covering difficulity range from -3 ~ 3 (by convention), I'll expand this a bit (-4 ~ 4) as we have wider range items to choose. For n items we'd like to select, we assign a Target difficulty by spliting the whole range into n parts. Then we have a non-changeable spacing reference, namely difficulty to target.
+
+Thus our new cost function can write as (DTT: difficulty to target; wp: width penalty; dp: disc penalty; For convience I'll normalise each value): 
+
+$$
+C(i, k) = \lambda_1 \cdot \underbrace{\left\| \eta_i - \tau_k \right\|}_{\text{DTT}} + \lambda_2 \cdot \underbrace{\left\| \text{Width}_i \right\|}_{\text{WP}} + \lambda_3 \cdot \underbrace{\left\| \alpha_i - 1 \right\|}_{\text{DP}}
+$$
+
+```{r}
+
+pars_diff <- coef(irt1)$word[, , "Intercept"] %>%
+  as.data.frame() %>%
+  rownames_to_column("item") %>%
+  transmute(
+    item = item,
+    eta = Estimate,              
+    width = Q97.5 - Q2.5              
+  )
+
+
+pars_disc <- coef(irt2)$word[, , "logalpha_Intercept"] %>%
+  as.data.frame() %>%
+  rownames_to_column("item") %>%
+  transmute(
+    item = item,
+    alpha = exp(Estimate)             
+  )
+
+full_item_df <- pars_diff %>%
+  inner_join(pars_disc, by = "item")
+```
+
+
+
+```{r}
+
+w_min <- min(full_item_df$width)
+w_max <- max(full_item_df$width)
+full_item_df$n_pw <- (full_item_df$width - w_min) / (w_max - w_min)
+
+raw_pdisc <- abs(full_item_df$alpha - 1)
+d_min <- min(raw_pdisc)
+d_max <- max(raw_pdisc)
+full_item_df$n_pdisc <- (raw_pdisc - d_min) / (d_max - d_min)
+```
+
+
+
+
+
+
+
+
+```{r}
+targets <- seq(-3.5, 3.5, length.out = 90)
+n_items <- nrow(full_item_df)
+n_targets <- length(targets)
+
+# C. 距离矩阵计算 (Rows=Items, Cols=Targets)
+# outer函数快速计算所有 item-target 差值的绝对值
+dist_mat_raw <- abs(outer(full_item_df$eta, targets, "-"))
+
+# D. 距离矩阵归一化 (Normalize Distance Matrix to 0-1)
+dist_mat_norm <- (dist_mat_raw - min(dist_mat_raw)) / (max(dist_mat_raw) - min(dist_mat_raw))
+
+# E. 组合总成本矩阵
+# 将 Item 属性 (Width, Disc) 扩展为矩阵形式以便相加
+mat_pw    <- matrix(full_item_df$n_pw, nrow = n_items, ncol = n_targets, byrow = FALSE)
+mat_pdisc <- matrix(full_item_df$n_pdisc, nrow = n_items, ncol = n_targets, byrow = FALSE)
+
+# 核心权重设置: 3:3:1
+lambda1 <- 3 # Distance to Target
+lambda2 <- 3 # Width Penalty
+lambda3 <- 1 # Discrimination Penalty (Low Penalty)
+
+cost_matrix <- (lambda1 * dist_mat_norm) + 
+               (lambda2 * mat_pw) + 
+               (lambda3 * mat_pdisc)
+```
+
+
+```{r}
+cat(">>> Running Hungarian Assignment for 90 targets...\n")
+
+res <- lp.transport(
+  cost.mat = cost_matrix,
+  direction = "min",
+  row.signs = rep("<=", n_items), row.rhs = rep(1, n_items),   # 每个Item最多用1次
+  col.signs = rep("=", n_targets), col.rhs = rep(1, n_targets) # 每个Target必须有1个Item
+)
+
+if(res$status == 0) {
+  # 提取选中行的索引
+  selected_indices <- which(rowSums(res$solution) > 0.5)
+  final_item_list_90 <- full_item_df$item[selected_indices]
+  
+  cat(sprintf("✅ Optimization Success! Selected %d items.\n", length(final_item_list_90)))
+  
+  # 保存/查看结果
+  # saveRDS(final_item_list_90, "../saves/final_selected_items_90.rds")
+  print(head(final_item_list_90))
+  
+} else {
+  stop("❌ Optimization Failed. Check constraints.")
+}
+```
+
+```{r}
+
+irt_dat_final <- irt_dat %>%
+  filter(word %in% final_item_list_90)
+
+cat(sprintf(">>> Final Data Check: %d items, %d observations.\n", 
+            n_distinct(irt_dat_final$word), nrow(irt_dat_final)))
+final_1pl <- brm(
+  formula = formula_irt2,
+  data = irt_dat_final,
+  family = brmsfamily("bernoulli", link = "logit"), # 显式指定 logit 以防万一
+  prior = prior_1pl,
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4,
+  chains = 4,
+  iter = 2000,   
+  warmup = 1000,
+  seed = 12345,
+  backend = "cmdstanr",
+  threads = threading(2),
+  file = "../models/final_1pl_90items.rds" # 自动保存
+)
+```
+
+
+```{r}
+item_final_1pl <- ranef(final_1pl)$word
+
+# 3. 绘图 (应用排序 + 新主题)
+item_final_1pl[, , "Intercept"] %>%
+  as_tibble() %>%
+  rownames_to_column() %>%
+  rename(item = "rowname") %>%
+  mutate(item = reorder(item, Estimate)) %>% 
+  ggplot(aes(item, Estimate, ymin = Q2.5, ymax = Q97.5)) +
+    geom_pointrange() +
+    coord_flip() + 
+    labs(x = "Item Number")
+```
+```{r}
+
+irt_dat_orig_list <- irt_dat %>%
+  filter(word %in% target_words_orig)
+
+# 3. 直接运行 1PL 模型
+# (这里不需要再定义公式了，直接写在 brm 里更紧凑，或者沿用之前的 formula_final_1pl)
+fit_orig_1pl <- brm(
+  formula = score ~ 1 + (1 | word) + (1 | subjID), # 1PL 标准公式
+  data = irt_dat_orig_list,
+  family = brmsfamily("bernoulli", link = "logit"),
+  prior = prior("normal(0, 3)", class = "sd", group = "word") +
+          prior("normal(0, 1)", class = "sd", group = "subjID"),
+  control = list(adapt_delta = 0.95, max_treedepth = 15),
+  cores = 4, chains = 4, iter = 2000, warmup = 1000,
+  seed = 12345,
+  backend = "cmdstanr",
+  threads = threading(2),
+  file = "../models/fit_orig_list_1pl.rds"
+)
+
+
+```
+
+```{r}
+item_ori_1pl <- ranef(fit_orig_1pl)$word
+
+# 3. 绘图 (应用排序 + 新主题)
+item_ori_1pl[, , "Intercept"] %>%
+  as_tibble() %>%
+  rownames_to_column() %>%
+  rename(item = "rowname") %>%
+  mutate(item = reorder(item, Estimate)) %>% 
+  ggplot(aes(item, Estimate, ymin = Q2.5, ymax = Q97.5)) +
+    geom_pointrange() +
+    coord_flip() + 
+    labs(x = "Item Number")
+```
+
+
+#### Extract In- and Outfit
+
+```{r}
+# rasch_fit_draws_fit_sel <- irt_dat%>%
+#   filter(word %in% fit_selected_items)%>%
+#   add_epred_draws(irt1_fit_sel, re_formula = ~(1 | word) + (1 | subjID), ndraws = 1000)
+# 
+# rasch_fit_fit_sel <- rasch_fit_draws_fit_sel%>%
+#   mutate(zvi = (score - .epred)/(.epred*(1-.epred))^0.5)%>%
+#   group_by(word,aoa_rating_german, .draw)%>%
+#   summarise(outfit = sum(zvi^2)/length(unique(subjID)),
+#             infit = (sum(zvi^2*(.epred*(1-.epred)))/sum(.epred*(1-.epred))))
+# 
+# rasch_fit_mode_fit_sel <- rasch_fit_fit_sel%>%
+#   pivot_longer(names_to = "fit_index", values_to = "value", cols = c(outfit, infit))%>%
+#   group_by(word, aoa_rating_german, fit_index)%>%
+#   summarise(mode = estimate_mode(value),
+#             lci = hdi_lower(value),
+#             uci = hdi_upper(value))
+# 
+# saveRDS(rasch_fit_mode_fit_sel, "../saves/rasch_fit_mode_fit_sel.rds")
+
+rasch_fit_mode_fit_sel <- readRDS("../saves/rasch_fit_mode_fit_sel.rds")
+```
+
+### Compute modindices based on frequentist model
+
+```{r}
+# all_items <- irt_dat%>%
+#   filter(word %in% fit_selected_items)%>%
+#   distinct(word)%>%
+#   pull(word)
+# 
+# irt_all <- irt_dat%>%
+#   filter(word %in% fit_selected_items)%>%
+#   select(-aoa_rating_german)%>%
+#   pivot_wider(names_from = word, values_from = score)%>%
+#   select( -subjID, -sex)
+# 
+# modelAllx <- paste(paste0("1*",all_items, "+"), collapse = " ")
+# 
+# modelAll <- paste0("f =~", substr(modelAllx, 1, nchar(modelAllx)-1))
+# 
+# freqAll <- sem(modelAll, irt_all, ordered =TRUE, parameterization = "theta")
+# 
+# saveRDS(freqAll, "../saves/freqAll.rds")
+# 
+# freqAll <- readRDS("../saves/freqAll.rds")
+# 
+# miAll <- modindices(freqAll)
+# 
+# miAllSel <- miAll%>%
+#   filter(lhs == "f")
+#   
+# saveRDS(miAllSel, "../saves/miAllSel.rds")
+```
+
+## Indices for item selection
+
+```{r}
+mi <- readRDS("../saves/miAllSel.rds")%>%arrange(rhs)%>%pull(mi)
+items <-data%>%filter(word %in% readRDS( "../saves/fit_selected_items.rds"))%>%distinct(word)%>%arrange(word)%>%pull(word)
+easiness_1PL_fit_sel <- readRDS("../saves/easiness_1PL_sel.rds")%>%arrange(word) %>%pull(Estimate.Intercept)
+infit_fit_sel <- readRDS("../saves/rasch_fit_mode_fit_sel.rds") %>% filter(fit_index == "infit")%>%arrange(word)%>% pull(mode)
+outfit_fit_sel <- readRDS("../saves/rasch_fit_mode_fit_sel.rds") %>% filter(fit_index == "outfit")%>%arrange(word)%>% pull(mode)
+```
+
+## Step 3: Simulated annealing
+
+```{r}
+source("../scripts/simulated_annealing.R")
+```
+
+### Test run
+
+```{r, message=F, warning=F, comment=F}
+sim_test <- simulated_annealing_rasch(100)
+
+items[unlist(sim_test$best_subset) == TRUE]
+```
+
+### Compare 1PL and 2PL model for different sizes
+
+Run script `run2PLmodel_sel_fit.R` to fit 2PL model with selected items (needed for model comparison)
+
+```{r}
+irt2PL_fit_sel <- readRDS("../saves/irt2PL_fit_sel.rds")
+```
+
+Run script `selected_model_comparison.R`
+
+#### Visualize Model comparison for different sizes
+
+```{r}
+readRDS("../saves/model_comparison_size.rds")%>%
+  mutate(ratio = abs(elpd_diff) / (2*se_diff))%>%
+  mutate(ratio = ifelse( elpd_diff == 0,0,ratio))%>%
+  filter(ratio != 0)%>%
+  mutate(ratio = ifelse(model == "m2PL", ratio*-1, ratio))%>%
+  arrange(iter, size)%>%
+  ggplot(aes(y = size, x = ratio, col = factor(iter)))+
+  geom_vline(xintercept = c(-1,1), alpha = .5, col = "#31493C", lty = 3)+
+  geom_vline(xintercept = 0, col = "black", lty = 1, size = 1)+
+  geom_point(alpha = .75)+
+  scale_y_continuous(breaks = c(70,75,80,85,90,95,100,125,175))+
+  scale_x_continuous( limits = c(-6,6), breaks = c(-5,-2, -1, 0, 1, 2, 5), labels = c("5.00","2.00","1.00","0.00", "1.00","2.00", "5.00"))+
+  scale_color_ptol(guide = "none")+
+  theme_bw()+
+  theme(panel.grid.minor = element_blank())+
+  labs(y = "No. of items in subset", x = expression(paste("Model comparison: ", frac(Delta ~ elpd, "2 *"~SE(Delta ~ elpd)))))+
+  annotation_custom(textGrob("1PL wins", 
+                             gp=gpar(fontsize=13,
+                                     col = "black", 
+                                     fontface="bold")),
+                    xmin=-3, xmax=-3, ymin=160, ymax=160) +
+  annotation_custom(textGrob("2PL wins",
+                             gp=gpar(fontsize=13,
+                                     col = "black",
+                                     fontface="bold")),
+                    xmin=3, xmax=3, ymin=160, ymax=160)
+
+```
+
+### Select items for preferred size (90 items)
+
+Run script `item_selection.R`
+
+```{r}
+sel_items_90 <- readRDS("../saves/item_selection.rds")%>%
+  filter(size == 90)%>%
+  select(items)%>%
+  unnest()%>%
+  group_by(items)%>%
+  summarise(n = n())%>%
+  arrange(-n)%>%
+  head(90)%>%
+  pull(items)
+
+```
+
+## Step 4: Differential item functioning (split by sex)
+
+### Model
+
+```{r}
+irt_dat_sel_90 <- irt_dat%>%
+  filter(word %in% sel_items_90)
+```
+
+```{r}
+# irt1_final_90_dif_sex <-  brm(
+#   data = irt_dat_sel_90,
+#   family = bernoulli(),
+#   score ~ 1 + (0+ sex | word) + (1 | subjID),
+#   prior = prior_1pl,
+#   control = list(adapt_delta = 0.95, max_treedepth = 20),
+#   cores = 6,
+#   chains = 6,
+#   iter = 8000,
+#   threads = threading(8), #to speed things up, comment out if not on a cluster
+#   backend = "cmdstanr" #to speed things up, comment out if not on a cluster
+# )%>%add_criterion(c("loo"), cores = 2, ndraws = 2000)
+# 
+# 
+# saveRDS(irt1_final_90_dif_sex, "../saves/irt1_final_90_dif_sex.rds")
+# 
+# irt1_final_90_dif_sex<- readRDS("../saves/irt1_final_90_dif_sex.rds")
+
+```
+
+### Visual model inspection
+
+```{r}
+# final_90_dif_sex <- as_draws_df(irt1_final_90_dif_sex)%>%
+#   select(b_Intercept, starts_with("r_word"))%>%
+#   mutate(iter = 1:n()) %>%
+#   pivot_longer(starts_with("r_word")) %>%
+#   mutate(name = str_remove(name, pattern = "r_word"),
+#          name = str_remove_all(name, pattern = "\\[|\\]"))%>%
+#   separate(name, into = c("item", "sex"), sep = "\\,")%>%
+#   mutate(sex = str_remove(sex, pattern = "sex"),
+#          val =  value)%>%
+#   group_by(item, sex)%>%
+#   summarise(mode = estimate_mode(val),
+#             uci = hdi_upper(val),
+#             lci = hdi_lower(val))%>%
+#   left_join(aoa%>%rename(item = word))
+# 
+# saveRDS(final_90_dif_sex, "../saves/model_params_irt1_final_90_dif_sex.rds")
+
+final_90_dif_sex <- readRDS("../saves/model_params_irt1_final_90_dif_sex.rds")
+
+final_90_dif_sex%>%
+  group_by(item)%>%
+  mutate(dif = abs(abs(mode) - lag(abs(mode))))%>%
+  fill(dif, .direction = "up")%>%
+ggplot(.,aes(x = reorder(item, dif))) +
+	geom_point(aes(col = sex, y = lci), position = position_dodge(width = .5)) +
+  geom_point(aes(col = sex, y = uci), position = position_dodge(width = .5)) +
+  geom_linerange(aes(col = sex, ymin = lci + 0.1, ymax = uci-0.1), position = position_dodge(width = .5), alpha = .5) +
+	coord_flip() +
+  scale_color_colorblind(labels = c("male","female"), name = "Group")+
+	labs(x = "Item", y = "Easiness estimate")+
+  theme_minimal()
+```
+```{r}
+final_90_dif_sex%>%
+  pivot_wider(names_from = sex, values_from = c(mode,uci,lci))%>%
+  ggplot(., aes(x = mode_f, y = mode_m))+
+  geom_abline(intercept = 0, slope = 1, lty = 3, alpha = .75)+
+  geom_point(pch = 1, size = 2, stroke  = 1, aes(col = factor(aoa_rating_german)))+
+  geom_linerange(aes(ymin = lci_m, ymax = uci_m),  alpha = .25, lty = 1)+
+  geom_linerange(aes(xmin = lci_f, xmax = uci_f),  alpha = .25, lty = 1)+
+  #geom_text(aes(label = item, x = uci_f +0.2))+
+  labs(x = "Group: female", y = "Group: male")+
+  scale_color_viridis_d()+
+  guides(col = F)+
+  coord_fixed()+
+  theme_few()
+  
+```
+
+## Final item selection
+
+```{r}
+# final_items <- readRDS("../saves/item_selection.rds")%>%
+#   filter(size == 90)%>%
+#   select(items)%>%
+#   unnest()%>%
+#   group_by(items)%>%
+#   summarise(n = n())%>%
+#   arrange(-n)%>%
+#   head(90)%>%
+#   filter(items != "verloben")%>%
+#   pull(items)
+# 
+# saveRDS(final_items, "../saves/final_items.rds")
+```
+
+```{r}
+data%>%
+  filter(word %in% readRDS("../saves/final_items.rds"))%>%
+  distinct(word, english, word_type)%>%
+  write_csv("../data/final_item_list.csv")
+```
+
+# Final model
+
+## Model
+
+```{r}
+irt_dat_final <- irt_dat%>%
+  filter(word %in% final_items)
+```
+
+
+```{r}
+# irt1_final <- brm(
+#   data = irt_dat_final,
+#   family = bernoulli(),
+#   score ~ 1 + (1| word) + (1 | subjID),
+#   prior = prior_1pl,
+#   control = list(adapt_delta = 0.95, max_treedepth = 20),
+#   cores = 6,
+#   chains = 6,
+#   iter = 8000,
+#   threads = threading(8), #to speed things up, comment out if not on a cluster
+#   backend = "cmdstanr" #to speed things up, comment out if not on a cluster
+# )%>%add_criterion(c("loo"), cores = 2, ndraws = 2000)
+# 
+# 
+# saveRDS(irt1_final, "../saves/irt1_final.rds")
+# 
+# irt1_final <- readRDS("../saves/irt1_final.rds")
+```
+
+## Item characteristics curves
+
+```{r}
+# icc1_final <- posterior_samples(irt1_final)%>% 
+#   select(b_Intercept, starts_with("r_word"))%>%
+#   mutate(iter = 1:n()) %>% 
+#   pivot_longer(starts_with("r_word"), names_to = "item", values_to = "xi") %>%
+#   mutate(item = str_extract(string = item, pattern = "(?<=\\[).*(?=,Intercept\\])"))%>%
+#   expand(nesting(iter, b_Intercept, item, xi),
+#          theta = seq(from = -6, to = 6, length.out = 100)) %>% 
+#   mutate(p = inv_logit_scaled(b_Intercept + xi + theta)) %>% 
+#   group_by(theta, item) %>% 
+#   summarise(p = mean(p))%>%
+#   left_join(aoa%>%rename(item = word))
+# 
+# saveRDS(icc1_final, "../saves/icc1_final.rds")
+
+icc1_final <- readRDS("../saves/icc1_final.rds")
+```
+
+```{r}
+p_icc <- icc1_final %>% 
+  ggplot(aes(x = theta, y = p,group = item, col = aoa_rating_german)) +
+  geom_line() +
+  scale_color_viridis_c(name = "Rated age of acquisition") +
+  labs(x = expression(theta~('ability on the logit scale')),
+       y = expression(italic(p)(y==1))) +
+  theme_few()+
+  theme(legend.position = c(0.85, 0.2), legend.direction = "horizontal", legend.title.align = 0.5, legend.background = element_blank())+
+  guides(colour = guide_colourbar(title.position="top"))
+```
+
+## Test information curve
+
+```{r}
+# tic1_final <- as_draws_df(irt1_final) %>% 
+#   select(.draw, b_Intercept, starts_with("r_word")) %>% 
+#   pivot_longer(starts_with("r_word"), names_to = "item", values_to = "xi") %>%
+#   mutate(item = str_extract(string = item, pattern = "(?<=\\[).*(?=,Intercept\\])"))%>%
+#   expand(nesting(.draw, b_Intercept, item, xi),
+#          theta = seq(from = -6, to = 6, length.out = 200)) %>% 
+#   mutate(p = inv_logit_scaled(b_Intercept + xi + theta)) %>% 
+#   mutate(i = p * (1 - p)) %>% 
+#   group_by(theta, .draw) %>% 
+#   summarise(sum_i = sum(i)) %>% 
+#   group_by(theta) %>% 
+#   summarise(i = median(sum_i))
+#   
+# saveRDS(tic1_final, "../saves/tic1_final.rds")
+
+tic1_final <- readRDS("../saves/tic1_final.rds")
+
+
+p_tic <- ggplot(tic1_final, aes(x = theta, y = i)) +
+  geom_line() +
+  labs(x = expression(theta~('ability on the logit scale')),
+       y = "Test information") +
+  theme_few()
+```
+
+```{r}
+ggdraw() +
+  draw_plot(p_icc)+
+  draw_plot(p_tic + theme(plot.background = element_blank()), x = 0.065, y = .68, width = .25, height = .3)
+
+```
+## Reliability
+
+### KR20
+
+```{r}
+rel_dat <- irt_dat%>%
+  select(-sex, -aoa_rating_german)%>%
+  filter(word %in% final_items)%>%
+  group_by(subjID)%>%
+  distinct(word, .keep_all = T)%>%
+  pivot_wider(names_from = word, values_from = score)%>%
+  ungroup()%>%
+  select(-subjID)
+
+kr20_rel <- kr20(rel_dat, hit = 1)
+
+kr20_rel
+```
+
+### Andrich Reliability
+
+```{r}
+# pers_params <- ranef(irt1_final)$subjID%>%as_tibble(rownames = "subjID")
+# 
+# andrich_rel <- 1 - 
+#   (1/length(pers_params$Estimate.Intercept) * sum(pers_params$Est.Error.Intercept^2))/
+#   (1/(length(pers_params$Estimate.Intercept)-1)*sum((pers_params$Estimate.Intercept - mean(pers_params$Estimate.Intercept))^2))
+# 
+# andrich_rel
+```
+
+```{r}
+# tibble(type = c("kr20", "andrich"), 
+#        rel = c(kr20_rel, andrich_rel))%>%
+#   saveRDS("../saves/reliability.rds")
+
+readRDS("../saves/reliability.rds")
+```
+
+# Validity
+
+Link PREVIC scores with receptive vocabualry scores of the oREV.
+
+```{r}
+orev_data <- read_csv("../data/orev_data.csv")
+
+link_data <- data%>%
+  filter(word %in% final_items)%>%
+  group_by(subjID)%>%
+  summarise(previc = sum(score))%>%
+  left_join(orev_data%>%
+              group_by(subjID)%>%
+              summarise(orev = sum(correct)))%>%
+  filter(!is.na(orev))%>%
+  ungroup()%>%
+  distinct(subjID, .keep_all = T)
+
+cor.test(link_data$previc, link_data$orev)
+```
+
+```{r}
+ggplot(link_data, aes(x = orev, y = previc))+
+  geom_smooth(method = "lm", inherit.aes = F, aes(y = previc, x = orev), col = "firebrick")+
+  geom_point(pch = 19,stroke = F,  alpha = .5, size = 2)+
+  stat_cor(inherit.aes = F, aes(x = previc, y = orev))+
+  theme_bw()
+```
+
+```{r}
+m_prev_orev <- data%>%
+  filter(word %in% final_items)%>%
+  group_by(subjID)%>%
+  group_by(age, subjID)%>%
+  summarise(sum  = sum(score),
+            n = n())%>%
+  left_join(orev_data%>%
+              group_by(subjID)%>%
+              summarise(orev = sum(correct)))%>%
+  filter(!is.na(orev))%>%
+  ungroup()%>%
+  mutate(age = scale(age),
+         orev = scale(orev))
+  
+
+m1 <- brm(sum |trials(n) ~ age + orev, family = binomial, data = m_prev_orev, chains = 4, cores = 4)
+
+m1
+```
+
