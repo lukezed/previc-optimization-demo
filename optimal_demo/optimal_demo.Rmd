@@ -1,9 +1,10 @@
 ---
-title: "PREVIC Item selection"
+title: "PREVIC Item selection - affordable solution"
 output:
   pdf_document: default
   html_document: default
-date: "2023-07-20"
+date: "2025-12-09"
+author: "Chi Zhang"
 ---
 
 # Packages
@@ -272,7 +273,7 @@ irt2 <- add_criterion(
   ndraws = 1000
 )
 
-saveRDS(irt1, "/Users/chi/Desktop/previc-optimization-demo/models/rt2.rds")
+saveRDS(irt2, "/Users/chi/Desktop/previc-optimization-demo/models/irt2.rds")
 ```
 
 
