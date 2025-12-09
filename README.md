@@ -35,7 +35,7 @@ On this setup, the full workflow completes in **under 24 hours**. This demonstra
 ├── data/
 │   ├── final_item_list.csv      # The original author's selected items (Benchmark)
 │   ├── my_final_item_list.csv   # [OUTPUT] The optimized 90 items from my pipeline
-│   └── previc_data.csv          # Raw response data (Sensitive - Not tracked)
+│   └── previc_data.csv          # Raw response data
 ├── models/
 │   ├── irt1.rds                 # Base 1PL Global Model
 │   ├── irt2.rds                 # Base 2PL Global Model
